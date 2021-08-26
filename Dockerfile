@@ -1,4 +1,4 @@
-$FROM
+FROM $FROM
 COPY ./ /var/app/
 RUN npm i
 RUN npm audit fix
