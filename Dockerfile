@@ -1,3 +1,4 @@
+ARG IMAGE1
 FROM $IMAGE1
 COPY ./ /var/app/
 RUN npm i
