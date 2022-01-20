@@ -1,16 +1,22 @@
 // @ts-ignore not under root dir
 import * as config from '../config.json';
-import {chromium, ChromiumBrowser, errors} from "playwright-chromium";
+import {chromium, ChromiumBrowser, ChromiumBrowserContext, errors} from "playwright-chromium";
 import {BrowserContextOptions, LaunchOptions} from "playwright-chromium/types/types";
 import Task, {TaskTimes, DONE as TaskDONE, FAIL as TaskFAIL} from "./Task";
 import URL from "url";
 import OS from "os";
 import {Stats} from "./Stats";
-import Context from "./Context";
+import StatsContext from "./StatsContext";
 import ProxyServer from "./ProxyServer";
-import ChromeRandomUserAgent from "./modules/ChromeRandomUserAgent";
-import Stealth from "./modules/Stealth";
+import ChromeRandomUserAgent from "./helpers/ChromeRandomUserAgent";
+import StealthPrepareOptions from "./helpers/StealthPrepareOptions";
+import StealthWrapContext from "./helpers/StealthWrapContext";
 import TimeoutError = errors.TimeoutError;
+import tmp from "tmp";
+import * as fs from "fs";
+import {execSync} from "child_process";
+import BlockRequest from "./modules/BlockRequest";
+import {debug as isDebug} from "debug";
 
 export interface RunOptions {
     WORKERS_PER_CPU: number,
@@ -23,14 +29,14 @@ export interface RunOptions {
 export default class BrowsersPool {
 
     private browser: ChromiumBrowser | null = null;
-    private localProxyServer: ProxyServer|null = null;
+    private localProxyServer: ProxyServer | null = null;
 
     private readonly maxWorkers: number;
     private tasksQueue: Task[] = [];
     private taskManager: NodeJS.Timeout | null = null;
     private readonly taskTimeout: number;
 
-    private contexts: Context[] = [];
+    private statsContexts: StatsContext[] = [];
 
     private stats: Stats;
     private readonly launchOptions: LaunchOptions;
@@ -39,12 +45,26 @@ export default class BrowsersPool {
 
     private modules = {
         URL: URL,
+        'blockRequest': BlockRequest
     };
 
+    private static fatalError(task: Task): void {
+        task.getCallback()(TaskFAIL, {
+            'error': `Fatal Error | unhandledRejection`,
+            'log': JSON.stringify('FATAL'),
+            'stack': 'No stack'
+        }, task.getTaskTime());
+    }
+
     public constructor(stats: Stats, runOptions: RunOptions) {
+        //Init Error handler
+        process.on('unhandledRejection', () => {
+            this.tasksQueue.forEach(task => BrowsersPool.fatalError(task));
+            process.exit(1);
+        });
 
         //Stats init
-        stats.setContexts(this.contexts);
+        stats.setContexts(this.statsContexts);
         this.stats = stats;
 
         this.launchOptions = <LaunchOptions>runOptions.LAUNCH_OPTIONS;
@@ -62,8 +82,7 @@ export default class BrowsersPool {
         //UserAgent
         if (runOptions.USER_AGENT !== undefined) {
             this.launchOptions.args.push(`--user-agent=${runOptions.USER_AGENT}`);
-        }
-        else {
+        } else {
             const randomUA = new ChromeRandomUserAgent();
             this.launchOptions.args.push(`--user-agent=${randomUA.getUserAgent()}`)
         }
@@ -71,8 +90,7 @@ export default class BrowsersPool {
         //Lang
         if (runOptions.ACCEPT_LANGUAGE !== undefined) {
             this.launchOptions.args.push(`--lang=${runOptions.USER_AGENT}`);
-        }
-        else {
+        } else {
             this.launchOptions.args.push(`--lang=en-US,en`);
         }
 
@@ -83,11 +101,6 @@ export default class BrowsersPool {
 
         //Browser name checker
         this.runBrowser();
-    }
-
-    public removeContext(context: Context) {
-        let statsContextIndex = this.contexts.indexOf(context);
-        if (statsContextIndex >= 0) this.contexts.splice(statsContextIndex);
     }
 
     public async runBrowser() {
@@ -105,87 +118,140 @@ export default class BrowsersPool {
         }
     }
 
+    private removeStatsContext(context: StatsContext) {
+        const statsContextIndex = this.statsContexts.indexOf(context);
+        if (statsContextIndex >= 0) this.statsContexts.splice(statsContextIndex);
+    }
+
+    private async newStatsContext(task: Task): Promise<StatsContext> {
+        if (this.browser === null) {
+            throw new Error('this.browser does not exist');
+        }
+
+        task.setRunTime();
+        const statsContext = new StatsContext();
+        const contextOption = task.getContextOptions();
+
+        StealthPrepareOptions(contextOption);
+        const context = await this.browser.newContext(contextOption);
+        await StealthWrapContext(context, contextOption);
+
+        statsContext.setBrowserContext(context);
+        this.statsContexts.push(statsContext);
+
+        return statsContext;
+    }
+
+    private static checkScriptSyntax(script: string): boolean {
+        //todo passthrough stack log
+        const tmpObject = tmp.fileSync({
+            prefix: 'playwright-task-server',
+            postfix: '.js'
+        });
+        fs.writeSync(tmpObject.fd, `async () => {;\n${script}\n;}`);
+
+        try {
+            execSync(`node --check ${tmpObject.name}`);
+            tmpObject.removeCallback();
+            return true;
+        } catch (e) {
+            tmpObject.removeCallback();
+            return false;
+        }
+    }
+
+    private runScript(script: string, context: ChromiumBrowserContext): Promise<any> {
+        return (new Function(
+                'context', 'modules', 'taskTimeout',
+                `return new Promise(async (resolve, reject) => {
+                                        setTimeout(() => {reject('Max Task Timeout')}, taskTimeout);
+                                        try {
+                                            ${script}
+                                            resolve({});
+                                        } catch (e) {
+                                            reject(e);
+                     2                   }
+                                });`)
+        )(context, this.modules, this.taskTimeout);
+    }
+
     public async runTaskManager() {
         console.log('Running Task Manager');
 
-        this.taskManager = setInterval(() => {
-            if (this.browser !== null && this.browser.isConnected() && this.contexts.length < this.maxWorkers) {
-                // @ts-ignore fix for task.getScript()
-                let task: Task = this.tasksQueue.shift();
+        this.taskManager = setInterval(async () => {
+            if (this.browser !== null && this.browser.isConnected() && this.statsContexts.length < this.maxWorkers) {
+                const task: Task | undefined = this.tasksQueue.shift();
                 if (task !== undefined) {
-                    task.setRunTime();
+                    if (BrowsersPool.checkScriptSyntax(task.getScript())) {
+                        const statsContext = await this.newStatsContext(task);
+                        //@ts-ignore we are already have context
+                        this.runScript(task.getScript(), statsContext.getBrowserContext())
+                            .then(async (response: object) => {
+                                statsContext.closeContext(); //Do not wait
+                                this.stats.addSuccess();
+                                this.removeStatsContext(statsContext)
+                                task.setDoneTime();
 
-                    let statsContext = new Context();
-                    this.contexts.push(statsContext);
-
-                    (new Promise<any>(async (resolve, reject) => {
-                        try {
-                            const contextOption = task.getContextOptions();
-
-                            // @ts-ignore can't be null
-                            const context = await this.browser.newContext(contextOption);
-                            await Stealth(context);
-
-                            context.on('page', async page => {
-                                page.on('console', async msg => {
-                                    for (let i = 0; i < msg.args().length; ++i)
-                                        console.log(`${i}: ${await msg.args()[i].jsonValue()}`);
-                                })
+                                if (typeof response !== 'object') {
+                                    response = {response};
+                                }
+                                if (isDebug("pw:response")) {
+                                    console.log('Task Done');
+                                }
+                                task.getCallback()(TaskDONE, response, task.getTaskTime());
                             })
+                            .catch(async (e: any) => {
+                                statsContext.closeContext();
+                                this.removeStatsContext(statsContext)
+                                task.setDoneTime();
 
-                            statsContext.setBrowserContext(context);
-
-                            const script = new Function('context', 'modules', 'taskTimeout',
-                                `return new Promise(async (resolve, reject) => {
-                                        setTimeout(() => {reject('Max Task Timeout')}, taskTimeout);
-                                        ${task.getScript()}
-                                        resolve({});
-                                });`
-                            );
-                            script(context, this.modules, this.taskTimeout)
-                                .then(resolve)
-                                .catch(reject);
-                        } catch (e) {
-                            reject(e);
+                                if (e instanceof TimeoutError) {
+                                    this.stats.addTimeout();
+                                    const error = {
+                                        'error': 'TimeoutError inside script',
+                                        'log': e.toString(),
+                                        'stack': e.stack
+                                    };
+                                    if (isDebug("pw:response")) {
+                                        console.log(error);
+                                    }
+                                    task.getCallback()(TaskFAIL, error, task.getTaskTime());
+                                } else if (e instanceof Error) {
+                                    this.stats.addFail();
+                                    const error = {
+                                        'error': `Error inside script | ${e.message}`,
+                                        'log': e.toString(),
+                                        'stack': e.stack
+                                    };
+                                    if (isDebug("pw:response")) {
+                                        console.log(error);
+                                    }
+                                    task.getCallback()(TaskFAIL, error, task.getTaskTime());
+                                } else {
+                                    this.stats.addFail();
+                                    const error = {
+                                        'error': `Unprocessable error, see logs`,
+                                        'log': JSON.stringify(e),
+                                        'stack': 'No stack'
+                                    };
+                                    if (isDebug("pw:response")) {
+                                        console.log(error);
+                                    }
+                                    task.getCallback()(TaskFAIL, error, task.getTaskTime());
+                                }
+                            });
+                    } else {
+                        this.stats.addFail();
+                        const error = {
+                            'error': `Script Error | Check Syntax`,
+                            'log': 'No log',
+                            'stack': 'No stack'
+                        };
+                        if (isDebug("pw:response")) {
+                            console.log(error);
                         }
-                    }))
-                        .then(async (response: object) => {
-                            statsContext.closeContext();
-                            this.stats.addSuccess();
-                            this.removeContext(statsContext)
-                            task.setDoneTime();
-
-                            if (typeof response !== 'object') {
-                                response = {response};
-                            }
-
-                            task.getCallback()(TaskDONE, response, task.getTaskTime());
-                        })
-                        .catch( async (e: any) => {
-                            statsContext.closeContext();
-                            this.removeContext(statsContext)
-                            task.setDoneTime();
-
-                            if (e instanceof TimeoutError) {
-                                task.getCallback()(TaskFAIL, {
-                                    'error': 'TimeoutError inside script',
-                                    'log': e.toString(),
-                                    'stack': e.stack
-                                }, task.getTaskTime());
-                            } else if (e instanceof Error) {
-                                task.getCallback()(TaskFAIL, {
-                                    'error': `Error inside script | ${e.message}`,
-                                    'log': e.toString(),
-                                    'stack': e.stack
-                                }, task.getTaskTime());
-                            } else {
-                                task.getCallback()(TaskFAIL, {
-                                    'error': `Unprocessable error, see logs`,
-                                    'log': JSON.stringify(e),
-                                    'stack': 'No stack'
-                                }, task.getTaskTime());
-                            }
-                        });
+                        task.getCallback()(TaskFAIL, error, task.getTaskTime());
+                    }
                 }
             } else if (this.browser !== null && !this.browser.isConnected()) {
                 this.stopTaskManager();
@@ -215,7 +281,7 @@ export default class BrowsersPool {
 
         if (typeof options.proxy !== 'object') {
             options.proxy = {
-                server: process.env.PW_TASK_PROXY ?? `socks5://127.0.0.1:${process.env.LOCAL_PRXOY_PORT}`,
+                server: process.env.PW_TASK_PROXY ?? `socks5://${ProxyServer.getHost()}:${ProxyServer.getPort()}`,
                 bypass: process.env.PW_TASK_BYPASS ?? "",
                 username: process.env.PW_TASK_USERNAME ?? "",
                 password: process.env.PW_TASK_PASSWORD ?? ""
